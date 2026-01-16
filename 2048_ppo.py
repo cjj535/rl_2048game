@@ -218,7 +218,8 @@ class ActorCritic(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, 1),
+            nn.ReLU(),
         )
 
     def forward(self, state):
@@ -429,7 +430,7 @@ class PPOTrainer:
         )
 
         # Normalize advantages
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = (advantages) / (advantages.std() + 1e-8)
 
         for _ in range(self.epochs):
             # Mini-batch sampling
