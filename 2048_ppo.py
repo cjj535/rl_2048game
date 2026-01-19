@@ -2,16 +2,13 @@
 2048 的 Docstring
 当前的reward的定义是每次行为增加的分数，但是2048是一个偏奖励累积的游戏，越到分数高（局面复杂的时候），新增分数越困难
 """
-import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from collections import deque
-import swanlab
-import os
 from typing import List, Tuple
 import random
+import math
 
 
 # 设置随机数种子
@@ -94,6 +91,7 @@ class Env:
                 i += 1
         new_row.extend([0] * (self.W - len(new_row)))
         changed = (new_row != row)
+        merge_score = math.log2(merge_score) if merge_score > 0 else 0.0
         return new_row, changed, merge_score
 
     def get_valid_actions(self) -> List[int]:
@@ -141,6 +139,9 @@ class Env:
 
         return valid_actions
 
+    def get_empty_sum(self):
+        return sum(cell == 0 for row in self.state for cell in row)
+
     def step(self, action: int):
         """
         执行一步动作
@@ -148,45 +149,43 @@ class Env:
         返回: (state, reward, done, info, extra) —— 兼容 Gym 风格
         """
         total_reward = 0
-        changed = False
+        empty_sum = self.get_empty_sum()
 
         if action == 0:  # left
             for i in range(self.H):
-                new_row, row_changed, score = self._slide_and_merge(self.state[i])
+                new_row, _, score = self._slide_and_merge(self.state[i])
                 self.state[i] = new_row
-                changed = changed or row_changed
                 total_reward += score
 
         elif action == 1:  # right
             for i in range(self.H):
                 reversed_row = self.state[i][::-1]
-                new_row, row_changed, score = self._slide_and_merge(reversed_row)
+                new_row, _, score = self._slide_and_merge(reversed_row)
                 self.state[i] = new_row[::-1]
-                changed = changed or row_changed
                 total_reward += score
 
         elif action == 2:  # up
             for j in range(self.W):
                 col = [self.state[i][j] for i in range(self.H)]
-                new_col, col_changed, score = self._slide_and_merge(col)
+                new_col, _, score = self._slide_and_merge(col)
                 for i in range(self.H):
                     self.state[i][j] = new_col[i]
-                changed = changed or col_changed
                 total_reward += score
 
         elif action == 3:  # down
             for j in range(self.W):
                 col = [self.state[i][j] for i in range(self.H)][::-1]
-                new_col, col_changed, score = self._slide_and_merge(col)
+                new_col, _, score = self._slide_and_merge(col)
                 new_col = new_col[::-1]
                 for i in range(self.H):
                     self.state[i][j] = new_col[i]
-                changed = changed or col_changed
                 total_reward += score
 
         # 如果有变化，添加新块（注意：add_random_tile 不影响 reward）
-        if changed:
-            self._add_random_tile()
+        self._add_random_tile()
+
+        new_empty_sum = self.get_empty_sum()
+        total_reward += (new_empty_sum + 1 - empty_sum) * 1
 
         done = 1 if self.check_game_over() else 0
 
@@ -203,43 +202,49 @@ class Env:
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim=16, action_dim=4, hidden_dim=128):
+    def __init__(self, action_dim=4):
         super().__init__()
-        self.actor = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, action_dim),
-            nn.Softmax(dim=-1)
-        )
-        self.critic = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1),
+        
+        # 输入: (batch, 1, 4, 4) —— 单通道 4x4 网格
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=2, stride=1, padding=0),  # -> (32, 3, 3)
             nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=2, stride=1, padding=0), # -> (64, 2, 2)
+            nn.ReLU(),
+            nn.Flatten(),  # -> (64*2*2 = 256)
         )
 
-    def forward(self, state):
-        return self.actor(state), self.critic(state)
+        # 共享特征
+        self.shared = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU()
+        )
 
-    def get_action(self, state, valid_actions_mask=None):
-        logits = self.actor(state)
-        if valid_actions_mask is not None:
-            # 将无效动作概率设为极小值
-            logits = logits * valid_actions_mask + 1e-8
-            probs = logits / logits.sum(dim=-1, keepdim=True)
-        else:
-            probs = logits
-        dist = torch.distributions.Categorical(probs)
-        action = dist.sample()                  # 按策略网络提供的概率采样
-        log_prob = dist.log_prob(action)
-        return action.item(), log_prob
+        # 策略头（Actor）
+        self.actor = nn.Sequential(
+            nn.Linear(64, action_dim),
+            nn.Softmax(dim=-1),
+        )
+
+        # 价值头（Critic）
+        self.critic = nn.Sequential(
+            nn.Linear(64, 1),
+        )
+
+    def forward(self, x):
+        # log转换
+        x = torch.where(x == 0, torch.zeros_like(x), torch.log2(x))
+
+        features = self.shared(self.conv(x))
+        logits = self.actor(features)
+        value = self.critic(features)
+
+        return logits, value
 
     def evaluate(self, state, action, valid_actions_mask=None):
-        logits = self.actor(state)
+        logits, value = self.forward(state)
         if valid_actions_mask is not None:
             logits = logits * valid_actions_mask + 1e-8
             probs = logits / logits.sum(dim=-1, keepdim=True)
@@ -248,7 +253,7 @@ class ActorCritic(nn.Module):
         dist = torch.distributions.Categorical(probs)
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
-        value = self.critic(state).squeeze(-1)
+        value = value.squeeze(-1)
         return log_prob, entropy, value
 
 
@@ -307,9 +312,9 @@ def augment_sample(
 
 
 class PPOTrainer:
-    def __init__(self, env_fn, lr=3e-4, gamma=0.99, lam=0.95, clip_eps=0.2,
+    def __init__(self, env, lr=3e-4, gamma=0.99, lam=0.95, clip_eps=0.2,
                  epochs=10, batch_size=256, max_steps=5000):
-        self.env_fn = env_fn
+        self.env = env
         self.gamma = gamma
         self.lam = lam
         self.clip_eps = clip_eps
@@ -326,21 +331,21 @@ class PPOTrainer:
         states, actions, log_probs, rewards, dones, values, masks = [], [], [], [], [], [], []
 
         for _ in range(num_episodes):
-            env = self.env_fn()
-            state = env.reset()
+            state = self.env.reset()
             step = 0
             while step < self.max_steps:
                 # 获取有效动作
-                valid_actions = env.get_valid_actions()
+                valid_actions = self.env.get_valid_actions()
                 if not valid_actions:
                     break
                 mask = torch.zeros(4, device=self.device)
                 mask[valid_actions] = 1.0
 
-                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-                state_tensor = state_tensor.view(1, -1)
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(self.device)   # 4, 4 -> 1, 1, 4, 4
                 with torch.no_grad():
                     probs, value = self.policy(state_tensor)
+                    probs = probs.squeeze(0)            # 1, 4 -> 4
+                    value = value.squeeze(0)            # 1, 1 -> 1
                     # 应用 mask
                     probs = probs * mask + 1e-8
                     probs = probs / probs.sum()
@@ -348,7 +353,7 @@ class PPOTrainer:
                     action = dist.sample()
                     log_prob = dist.log_prob(action)
 
-                next_state, reward, done, _, _ = env.step(action.item())
+                next_state, reward, done, _, _ = self.env.step(action.item())
 
                 states.append(np.array(state))
                 actions.append(action.item())
@@ -377,7 +382,7 @@ class PPOTrainer:
     def apply_augmentation_to_batch(self, data):
         """对整个批次应用数据增强"""
         aug_states, aug_actions, aug_log_probs, aug_advs, aug_returns, aug_masks = [], [], [], [], [], []
-        
+
         states = data['states']
         actions = data['actions']
         log_probs = data['old_log_probs']
@@ -413,11 +418,10 @@ class PPOTrainer:
 
     def update(self, data):
         # 通过旋转、翻转等操作进行数据增强
-        data = self.apply_augmentation_to_batch(data)
+        # data = self.apply_augmentation_to_batch(data)
 
         states = torch.from_numpy(
             np.stack(data['states'])
-            .reshape(len(data['states']), -1)
             .astype(np.float32)
         )
         actions = torch.tensor(data['actions'], dtype=torch.long)
@@ -445,6 +449,7 @@ class PPOTrainer:
                 ret_batch = returns[idx].to(self.device)
                 m_batch = masks[idx].to(self.device)
 
+                s_batch = s_batch.unsqueeze(1)      # B, 4, 4 -> B, 1, 4, 4
                 log_probs, entropy, values = self.policy.evaluate(s_batch, a_batch, m_batch)
                 ratios = torch.exp(log_probs - old_lp_batch)
                 surr1 = ratios * adv_batch
@@ -454,6 +459,7 @@ class PPOTrainer:
                 entropy_loss = entropy.mean()
 
                 loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy_loss
+                # loss = actor_loss + 0.5 * critic_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -461,27 +467,24 @@ class PPOTrainer:
                 self.optimizer.step()
 
     def train(self, total_timesteps=100000):
+        num_episodes=16
         timesteps = 0
-        update_steps = 0
+        max_steps = 0
         while timesteps < total_timesteps:
-            data = self.collect_trajectories()
+            data = self.collect_trajectories(num_episodes=num_episodes)
+            steps = len(data['states']) / num_episodes
             timesteps += len(data['states'])
             self.update(data)
-            print(f"Timesteps: {timesteps}, Avg Reward: {np.mean(data['returns']):.2f}")
+            print(f"Timesteps: {timesteps}, steps: {steps}, Avg Reward: {np.mean(data['returns']):.2f}")
 
-            update_steps += 1
-            if update_steps % 2 == 0:
+            # 坚持最久的一次训练结果保存下来
+            if steps > max_steps:
                 torch.save(self.policy.state_dict(), "ppo_2048.pth")
+                max_steps = steps
         torch.save(self.policy.state_dict(), "ppo_2048.pth")
 
-# ======================
-# 使用示例
-# ======================
+
 if __name__ == "__main__":
-    def make_env():
-        return Env()
-
     deterministic()
-
-    trainer = PPOTrainer(env_fn=make_env, lr=3e-4, gamma=0.99, lam=0.95, clip_eps=0.2, epochs=10)
+    trainer = PPOTrainer(env=Env(), lr=3e-4, gamma=0.99, lam=0.95, clip_eps=0.2, epochs=10)
     trainer.train(total_timesteps=16*8*4096*10)
