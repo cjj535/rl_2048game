@@ -68,7 +68,7 @@ class Env:
                     return False
         return True
 
-    def _slide_and_merge(self, row: List[int]) -> Tuple[List[int], bool, int]:
+    def _slide_and_merge(self, row: List[int]) -> Tuple[List[int], bool, float]:
         """
         对一行进行滑动和合并。
         返回:
@@ -84,14 +84,13 @@ class Env:
             if i + 1 < len(non_zero) and non_zero[i] == non_zero[i + 1]:
                 merged_val = non_zero[i] * 2
                 new_row.append(merged_val)
-                merge_score += merged_val  # 关键：累加合并结果值
+                merge_score += 1 + math.log2(non_zero[i]) / 10
                 i += 2
             else:
                 new_row.append(non_zero[i])
                 i += 1
         new_row.extend([0] * (self.W - len(new_row)))
         changed = (new_row != row)
-        merge_score = math.log2(merge_score) if merge_score > 0 else 0.0
         return new_row, changed, merge_score
 
     def get_valid_actions(self) -> List[int]:
@@ -184,6 +183,7 @@ class Env:
         # 如果有变化，添加新块（注意：add_random_tile 不影响 reward）
         self._add_random_tile()
 
+        # reward设计很重要，
         new_empty_sum = self.get_empty_sum()
         total_reward += (new_empty_sum + 1 - empty_sum) * 1
 
@@ -487,4 +487,4 @@ class PPOTrainer:
 if __name__ == "__main__":
     deterministic()
     trainer = PPOTrainer(env=Env(), lr=3e-4, gamma=0.99, lam=0.95, clip_eps=0.2, epochs=10)
-    trainer.train(total_timesteps=16*8*4096*10)
+    trainer.train(total_timesteps=16*1024*5)
