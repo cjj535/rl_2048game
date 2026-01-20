@@ -1,6 +1,7 @@
 """
 2048 的 Docstring
 当前的reward的定义是每次行为增加的分数，但是2048是一个偏奖励累积的游戏，越到分数高（局面复杂的时候），新增分数越困难
+PPO中reward使用了GAE，但这种奖励估计方法可能对2048游戏来说很难估计准确，可能需要改用类似alphaGo的训练方式
 """
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ from typing import List, Tuple
 import random
 import math
 import matplotlib.pyplot as plt
+import argparse
 
 # 设置随机数种子
 def deterministic():
@@ -209,41 +211,47 @@ class ActorCritic(nn.Module):
     def __init__(self, action_dim=4):
         super().__init__()
 
-        # CNN 部分 + BatchNorm2d
+        # 输入: (batch, 1, 4, 4)
         self.conv = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=2, stride=1, padding=0),  # (B,1,4,4) → (B,32,3,3)
-            nn.BatchNorm2d(32),
+            nn.Conv2d(1, 32, kernel_size=2, stride=1, padding=0),  # (32, 3, 3)
+            # nn.BatchNorm2d(32),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=2, stride=1, padding=0), # (B,32,3,3) → (B,64,2,2)
-            nn.BatchNorm2d(64),
+
+            nn.Conv2d(32, 64, kernel_size=2, stride=1, padding=0), # (64, 2, 2)
+            # nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.Flatten(),  # (B,64*2*2) = (B,256)
+
+            nn.Flatten(),  # 64*2*2 = 256
         )
 
-        # 共享 MLP 部分 + BatchNorm1d
+        # 共享特征
         self.shared = nn.Sequential(
             nn.Linear(256, 128),
+            # nn.LayerNorm(128),
             nn.ReLU(),
+
             nn.Linear(128, 64),
-            nn.ReLU()
+            # nn.LayerNorm(64),
+            nn.ReLU(),
         )
 
-        # 策略头（Actor）— 注意：Softmax 前不加 BN！
-        self.actor = nn.Linear(64, action_dim)  # 移除 Softmax（PPO 应输出 logits）
+        # Actor
+        self.actor = nn.Sequential(
+            nn.Linear(64, action_dim),
+            nn.Softmax(dim=-1),
+        )
 
-        # 价值头（Critic）— 不加 BN！
+        # Critic
         self.critic = nn.Linear(64, 1)
 
     def forward(self, x):
-        # 安全 log2 编码（0 → 0.0）
-        x = torch.where(x == 0, torch.zeros_like(x), torch.log2(x.float()))
+        # log2 转换（避免 log(0)）
+        x = torch.where(x == 0, torch.zeros_like(x), torch.log2(x))
 
-        features = self.conv(x)      # [B, 256]
-        shared = self.shared(features)  # [B, 64]
+        features = self.shared(self.conv(x))
+        logits = self.actor(features)
+        value = self.critic(features)
 
-        logits = self.actor(shared)   # [B, 4] —— 输出 logits，不是概率！
-        value = self.critic(shared)   # [B, 1]
-        
         return logits, value
 
     def evaluate(self, state, action, valid_actions_mask=None):
@@ -317,7 +325,7 @@ def augment_sample(
 class PPOTrainer:
     def __init__(self, env, lr=3e-4, gamma=0.99, lam=0.95, clip_eps=0.2,
                  epochs=10, batch_size=256, max_steps=5000):
-        self.env = env
+        self.env: Env = env
         self.gamma = gamma
         self.lam = lam
         self.clip_eps = clip_eps
@@ -356,7 +364,7 @@ class PPOTrainer:
                     action = dist.sample()
                     log_prob = dist.log_prob(action)
 
-                next_state, reward, done, _, _ = self.env.step(action.item())
+                next_state, reward, done, _, _ = self.env.step(int(action.item()))
 
                 states.append(np.array(state))
                 actions.append(action.item())
@@ -552,17 +560,27 @@ class VizEval:
             print("state score: ", value.cpu().numpy())
             print("next action: ", probs.cpu().numpy())
             input("+++++++++++++++++++++++++++++++++++++++++++++++++++")
-            next_state, reward, done, _, _ = self.env.step(action.item())
+            next_state, reward, done, _, _ = self.env.step(int(action.item()))
             state = next_state
             if done:
                 break
 
-if __name__ == "__main__":
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        type=str,
+        required=True,
+        choices=["train", "eval", "test"],
+        help="mode"
+    )
+    args = parser.parse_args()
+
     deterministic()
-    mode = "eval"
+    mode = args.mode
     if mode == "train":
         trainer = PPOTrainer(env=Env(), lr=3e-4, gamma=0.99, lam=0.95, clip_eps=0.2, epochs=10)
-        trainer.train(total_timesteps=16*1024*5)
+        trainer.train(total_timesteps=16*1024*20)
     else:
         np.set_printoptions(precision=2, suppress=True)
         init_state = [
@@ -573,3 +591,6 @@ if __name__ == "__main__":
         ]
         viz = VizEval(env=Env())
         viz.play(init_state)
+
+if __name__ == "__main__":
+    main()
