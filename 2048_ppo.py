@@ -9,7 +9,7 @@ import torch.optim as optim
 from typing import List, Tuple
 import random
 import math
-
+import matplotlib.pyplot as plt
 
 # 设置随机数种子
 def deterministic():
@@ -40,6 +40,10 @@ class Env:
         self.state = [[0 for _ in range(self.W)] for _ in range(self.H)]
         self._add_random_tile()
         return self.state
+    
+    def set_state(self, state) -> List[List[int]]:
+        """设置游戏状态"""
+        self.state = [[state[i][j] for j in range(self.W)] for i in range(self.H)]
 
     def _add_random_tile(self) -> int:
         """在空白位置随机添加一个新数字（2 或 4），返回该数字"""
@@ -204,17 +208,19 @@ class Env:
 class ActorCritic(nn.Module):
     def __init__(self, action_dim=4):
         super().__init__()
-        
-        # 输入: (batch, 1, 4, 4) —— 单通道 4x4 网格
+
+        # CNN 部分 + BatchNorm2d
         self.conv = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=2, stride=1, padding=0),  # -> (32, 3, 3)
+            nn.Conv2d(1, 32, kernel_size=2, stride=1, padding=0),  # (B,1,4,4) → (B,32,3,3)
+            nn.BatchNorm2d(32),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=2, stride=1, padding=0), # -> (64, 2, 2)
+            nn.Conv2d(32, 64, kernel_size=2, stride=1, padding=0), # (B,32,3,3) → (B,64,2,2)
+            nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.Flatten(),  # -> (64*2*2 = 256)
+            nn.Flatten(),  # (B,64*2*2) = (B,256)
         )
 
-        # 共享特征
+        # 共享 MLP 部分 + BatchNorm1d
         self.shared = nn.Sequential(
             nn.Linear(256, 128),
             nn.ReLU(),
@@ -222,25 +228,22 @@ class ActorCritic(nn.Module):
             nn.ReLU()
         )
 
-        # 策略头（Actor）
-        self.actor = nn.Sequential(
-            nn.Linear(64, action_dim),
-            nn.Softmax(dim=-1),
-        )
+        # 策略头（Actor）— 注意：Softmax 前不加 BN！
+        self.actor = nn.Linear(64, action_dim)  # 移除 Softmax（PPO 应输出 logits）
 
-        # 价值头（Critic）
-        self.critic = nn.Sequential(
-            nn.Linear(64, 1),
-        )
+        # 价值头（Critic）— 不加 BN！
+        self.critic = nn.Linear(64, 1)
 
     def forward(self, x):
-        # log转换
-        x = torch.where(x == 0, torch.zeros_like(x), torch.log2(x))
+        # 安全 log2 编码（0 → 0.0）
+        x = torch.where(x == 0, torch.zeros_like(x), torch.log2(x.float()))
 
-        features = self.shared(self.conv(x))
-        logits = self.actor(features)
-        value = self.critic(features)
+        features = self.conv(x)      # [B, 256]
+        shared = self.shared(features)  # [B, 64]
 
+        logits = self.actor(shared)   # [B, 4] —— 输出 logits，不是概率！
+        value = self.critic(shared)   # [B, 1]
+        
         return logits, value
 
     def evaluate(self, state, action, valid_actions_mask=None):
@@ -467,7 +470,7 @@ class PPOTrainer:
                 self.optimizer.step()
 
     def train(self, total_timesteps=100000):
-        num_episodes=16
+        num_episodes = 16
         timesteps = 0
         max_steps = 0
         while timesteps < total_timesteps:
@@ -484,7 +487,89 @@ class PPOTrainer:
         torch.save(self.policy.state_dict(), "ppo_2048.pth")
 
 
+class VizEval:
+    def __init__(self, env):
+        self.env: Env = env
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.policy = ActorCritic().to(self.device)
+        self.policy.load_state_dict(torch.load("ppo_2048.pth", map_location='cpu'))
+        self.policy.eval()
+
+    def viz(self, state):
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(self.device)
+        logits, score = self.policy(state_tensor)
+        logits = logits.squeeze(0)
+        score = score.squeeze(0)
+        print("state score: ", score)
+        print("next action: ", logits)
+
+        board = np.array(state, dtype=np.float32)
+
+        # 安全地计算 log2：0 保持为 0，正数取 log2
+        board = np.where(board == 0, 0.0, np.log2(board))
+
+        # 绘制热力图
+        plt.figure(figsize=(4, 4))
+        plt.imshow(board, cmap='viridis', interpolation='nearest')
+
+        for i in range(4):
+            for j in range(4):
+                plt.text(j, i, str(board[i, j]) if board[i, j] != 0 else '',
+                        ha="center", va="center", color="white", fontsize=14)
+
+        # 设置坐标轴
+        plt.xticks([])
+        plt.yticks([])
+        plt.title("2048 Board Heatmap")
+        plt.tight_layout()
+        plt.show()
+
+    def play(self, state):
+        self.env.set_state(state)
+        while True:
+            # self.viz(state)
+
+            # 获取有效动作
+            valid_actions = self.env.get_valid_actions()
+            if not valid_actions:
+                break
+            mask = torch.zeros(4, device=self.device)
+            mask[valid_actions] = 1.0
+
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).unsqueeze(0).to(self.device)   # 4, 4 -> 1, 1, 4, 4
+            with torch.no_grad():
+                probs, value = self.policy(state_tensor)
+                probs = probs.squeeze(0)            # 1, 4 -> 4
+                value = value.squeeze(0)            # 1, 1 -> 1
+                # 应用 mask
+                probs = probs * mask + 1e-8
+                probs = probs / probs.sum()
+                dist = torch.distributions.Categorical(probs)
+                action = dist.sample()
+
+            self.env.render()
+            print("state score: ", value.cpu().numpy())
+            print("next action: ", probs.cpu().numpy())
+            input("+++++++++++++++++++++++++++++++++++++++++++++++++++")
+            next_state, reward, done, _, _ = self.env.step(action.item())
+            state = next_state
+            if done:
+                break
+
 if __name__ == "__main__":
     deterministic()
-    trainer = PPOTrainer(env=Env(), lr=3e-4, gamma=0.99, lam=0.95, clip_eps=0.2, epochs=10)
-    trainer.train(total_timesteps=16*1024*5)
+    mode = "eval"
+    if mode == "train":
+        trainer = PPOTrainer(env=Env(), lr=3e-4, gamma=0.99, lam=0.95, clip_eps=0.2, epochs=10)
+        trainer.train(total_timesteps=16*1024*5)
+    else:
+        np.set_printoptions(precision=2, suppress=True)
+        init_state = [
+            [128, 8, 2, 2],
+            [2, 2, 8, 16],
+            [4, 2, 128, 2],
+            [4, 16, 8, 4]
+        ]
+        viz = VizEval(env=Env())
+        viz.play(init_state)
