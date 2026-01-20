@@ -566,10 +566,10 @@ if __name__ == "__main__":
     else:
         np.set_printoptions(precision=2, suppress=True)
         init_state = [
-            [128, 8, 2, 2],
-            [2, 2, 8, 16],
-            [4, 2, 128, 2],
-            [4, 16, 8, 4]
+            [8, 256, 64, 2],
+            [4, 128, 16, 16],
+            [2, 16, 32, 4],
+            [0, 4, 0, 2]
         ]
         viz = VizEval(env=Env())
         viz.play(init_state)
