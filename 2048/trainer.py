@@ -151,7 +151,7 @@ PPO method
 """
 class PPOTrainer:
     def __init__(self, env, lr=3e-4, gamma=0.99, lam=0.95, clip_eps=0.2,
-                 epochs=10, batch_size=512, max_steps=5000, num_ep=64, total_timesteps=1000000):
+                 epochs=10, batch_size=256, max_steps=5000, num_ep=32, total_timesteps=1000000):
         self.env: Env = env
         self.gamma = gamma
         self.lam = lam
