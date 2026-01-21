@@ -131,7 +131,7 @@ def main():
     method = args.method
     if mode == "train":
         if method == "PPO":
-            trainer = PPOTrainer(env=Env(), total_timesteps=16*1024*10)
+            trainer = PPOTrainer(env=Env())
             trainer.train()
         elif method == "DQN":
             trainer = DQNTrainer(env=Env())
