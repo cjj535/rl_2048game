@@ -3,6 +3,7 @@ import torch
 import matplotlib.pyplot as plt
 import argparse
 import random
+import math
 
 from env import Env
 from model import ActorCritic, QNetwork
@@ -53,23 +54,13 @@ class VizEval:
         plt.show()
 
     def play(self, state):
-        self.env.set_state(state)
+        state = self.env.set_state(state)
         while True:
-            # 获取有效动作
-            valid_actions = self.env.get_valid_actions()
-            if not valid_actions:
-                break
-            mask = torch.zeros(4, device=self.device)
-            mask[valid_actions] = 1.0
-
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)   # 16, 4, 4 -> 1, 16, 4, 4
             if self.method == "PPO":
                 with torch.no_grad():
                     probs, value = self.agent(state_tensor)
                     probs = probs.squeeze(0)            # 1, 4 -> 4
-                    value = value.squeeze(0)            # 1, 1 -> 1
-                    # 应用 mask
-                    probs = probs * mask + 1e-8
                     probs = probs / probs.sum()
                     dist = torch.distributions.Categorical(probs)
                     action = dist.sample()
@@ -77,7 +68,6 @@ class VizEval:
                 self.env.render()
                 print("state score: ", value.cpu().numpy())
                 print("next action: ", probs.cpu().numpy())
-                print("mask: ", mask.cpu().numpy())
                 input("+++++++++++++++++++++++++++++++++++++++++++++++++++")
                 next_state, _, done = self.env.step(int(action.item()))
                 state = next_state
@@ -87,13 +77,10 @@ class VizEval:
                 with torch.no_grad():
                     values = self.agent(state_tensor)
                     values = values.squeeze(0)            # 1, 4 -> 4
-                    values = values * mask + 1e-8
-                    values = values / values.sum()
                     action = torch.argmax(values)
 
                 self.env.render()
                 print("next action: ", values.cpu().numpy())
-                print("mask: ", mask.cpu().numpy())
                 input("+++++++++++++++++++++++++++++++++++++++++++++++++++")
                 next_state, _, done = self.env.step(int(action.item()))
                 state = next_state
