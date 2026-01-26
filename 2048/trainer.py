@@ -3,17 +3,23 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import random
+import math
 from collections import deque
+from torch.optim.lr_scheduler import LambdaLR
+import wandb
+from tqdm import tqdm
+import time
+import copy
 
 from env import Env
 from model import ActorCritic, QNetwork
 
 
 class DQNTrainer:
-    def __init__(self, env, episode=50000, batch_size=256, epsilon=0.5, buffer_size=2000, lr=1e-4):
+    def __init__(self, env, episode=200_000, batch_size=1024, epsilon=1.0, buffer_size=6000, lr=3e-4):
         self.env: Env = env
         self.episode = episode
-        self.epsilon_end = 0.01
+        self.epsilon_end = 0.000001
         self.epsilon_decay = 0.995
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -21,29 +27,48 @@ class DQNTrainer:
         self.target_net = QNetwork().to(self.device)  # 目标网络
         self.target_net.load_state_dict(self.q_net.state_dict())  # 将目标网络和当前网络初始化一致，避免网络不一致导致的训练波动
         self.best_net = QNetwork().to(self.device)
-        self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr)
+        self.optimizer = optim.AdamW(self.q_net.parameters(), lr=lr)
         self.replay_buffer = deque(maxlen=buffer_size)           # 经验回放缓冲区
         self.batch_size = batch_size
         self.gamma = 0.99
         self.epsilon = epsilon
-        self.update_target_freq = 300  # 目标网络更新频率
+        self.update_target_freq = 500  # 目标网络更新频率
         self.step_count = 0
         self.eval_episodes = 2  # 评估时的episode数量
         self.best_avg_sum = 0
 
+        def lr_lambda(current_step: int):
+            warmup_steps = 10000
+            total_steps = 20_000_000
+            if current_step<warmup_steps:
+                return float(current_step+1) / float(warmup_steps)
+            else:
+                # Warmup 后：余弦衰减（从 1 衰减到 0）
+                progress = float(current_step-warmup_steps) / float(total_steps-warmup_steps)
+                return max(1e-6, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        
+        self.scheduler = LambdaLR(self.optimizer, lr_lambda)
+
+        wandb.init(
+            project="my-2048-dqn",      # 项目名
+            name="dqn-cosine",
+            config={
+                "learning_rate": lr,
+                "gamma": self.gamma,
+                "bs": self.batch_size,
+                "update_target_freq": self.update_target_freq,
+            }
+        )
+        
     def choose_action(self, state, valid_actions) -> int:
         if np.random.rand() < self.epsilon:
             # 探索：在 valid_actions 中均匀随机选择
             return np.random.choice(valid_actions)
         else:
-            mask = torch.zeros(4, device=self.device)
-            mask[valid_actions] = 1.0
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             with torch.no_grad():
                 values = self.q_net(state_tensor)
                 values = values.squeeze(0)            # 1, 4 -> 4
-                values = values * mask + 1e-8
-                values = values / values.sum()
                 action = torch.argmax(values)
             return int(action.item())
 
@@ -76,16 +101,22 @@ class DQNTrainer:
         loss = nn.MSELoss()(current_q, target_q)                    # q_net学习新的奖励估计
         self.optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), 0.5)
         self.optimizer.step()
 
-        # 定期更新目标网络
-        self.step_count += 1
+        self.scheduler.step()
+
+        wandb.log({
+            "loss": loss.item(),
+            "lr": self.optimizer.param_groups[0]['lr'],
+        }, step=self.step_count)
+
         if self.step_count % self.update_target_freq == 0:
             # 使用深拷贝更新目标网络参数
             self.target_net.load_state_dict({
                 k: v.clone() for k, v in self.q_net.state_dict().items()
             })
-      
+
     def evaluate(self, episode):
         """评估当前模型的性能"""
         original_epsilon = self.epsilon
@@ -98,9 +129,7 @@ class DQNTrainer:
             state = self.env.reset()
             episode_reward = 0
             while True:
-                valid_actions = self.env.get_valid_actions()
-                if not valid_actions:
-                    break
+                valid_actions = self.env.get_actions()
                 action = self.choose_action(state, valid_actions)
                 next_state, reward, done = self.env.step(action)
                 episode_reward += reward
@@ -111,39 +140,45 @@ class DQNTrainer:
             sums.append(self.env.get_sum())
             maxs.append(self.env.get_max())
 
-        print(f"ep: {episode} | sums: {sums} | maxs: {maxs}")
-        print("-------------------------------")
+        # print(f"ep: {episode} | sums: {sums} | maxs: {maxs}")
+        # print("-------------------------------")
         self.epsilon = original_epsilon  # 恢复探索
-        return np.mean(total_rewards), np.mean(sums)
+        return np.mean(total_rewards), np.mean(sums), np.max(maxs)
 
     def train(self):
-        for episode in range(self.episode):            # 游戏轮数
+        for episode in tqdm(range(self.episode), desc="Training"):
             state = self.env.reset()
             while True:
-                valid_actions = self.env.get_valid_actions()
-                if not valid_actions:
-                    break
+                valid_actions = self.env.get_actions()
                 action = self.choose_action(state, valid_actions)
                 next_state, reward, done = self.env.step(action)
                 self.store_experience(state, action, reward, next_state, done)     # 缓存游戏过程
                 self.update()
 
-                state = next_state
+                self.step_count += 1
+                state = copy.deepcopy(next_state)
                 if done:
                     break
-        
+
             # epsilon是探索系数，随着每一轮训练，epsilon 逐渐减小
-            self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)  
-        
+            self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
+
             # 每10个episode评估一次模型
             if episode % 10 == 0:
-                _, avg_sum = self.evaluate(episode)
+                avg_reward, avg_sum, max_num = self.evaluate(episode)
+                wandb.log({
+                    "avg_reward": avg_reward,
+                    "avg_sum": avg_sum,
+                    "max_num": max_num,
+                    "epsilon": self.epsilon,
+                }, step=self.step_count)
+
                 if avg_sum > self.best_avg_sum:
                     self.best_avg_sum = avg_sum
                     # 深拷贝当前最优模型的参数
                     self.best_net.load_state_dict({k: v.clone() for k, v in self.q_net.state_dict().items()})
                     torch.save(self.q_net.state_dict(), "2048_DQN.pth")
-                    print(f"best average sum: {avg_sum}")
+                    
 
 
 """
@@ -170,25 +205,18 @@ class PPOTrainer:
 
     def collect_trajectories(self):
         """Collect trajectories for PPO update"""
-        states, actions, log_probs, rewards, dones, values, masks = [], [], [], [], [], [], []
+        states, actions, log_probs, rewards, dones, values = [], [], [], [], [], []
 
         for _ in range(self.num_episodes):
             state = self.env.reset()
             while True:
                 # 获取有效动作
-                valid_actions = self.env.get_valid_actions()
-                if not valid_actions:
-                    break
-                mask = torch.zeros(4, device=self.device, dtype=torch.float32)
-                mask[valid_actions] = 1.0
+                valid_actions = self.env.get_actions()
 
                 state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)   # 16, 4, 4 -> 1, 16, 4, 4
                 with torch.no_grad():
                     probs, value = self.agent(state_tensor)
                     probs = probs.squeeze(0)            # 1, 4 -> 4
-                    value = value.squeeze(0)            # 1, 1 -> 1
-                    # 应用 mask
-                    probs = probs * mask + 1e-8
                     probs = probs / probs.sum()
                     dist = torch.distributions.Categorical(probs)
                     action = dist.sample()
@@ -202,7 +230,6 @@ class PPOTrainer:
                 rewards.append(reward)
                 dones.append(done)
                 values.append(value)                    # 1
-                masks.append(mask)                      # 4
 
                 state = next_state
                 if done:
@@ -215,7 +242,6 @@ class PPOTrainer:
             'rewards': torch.FloatTensor(rewards),              # T
             'dones': torch.FloatTensor(dones),                  # T
             'values': torch.stack(values).squeeze(-1),          # T
-            'masks': torch.stack(masks),                        # T, 4
         }
 
     def update(self):
@@ -224,7 +250,6 @@ class PPOTrainer:
         old_log_probs = self.data_buffer['old_log_probs']
         advantages = self.data_buffer['advantages']
         returns = self.data_buffer['returns']
-        masks = self.data_buffer['masks']
 
         # Normalize advantages
         advantages = (advantages) / (advantages.std() + 1e-8)
@@ -241,15 +266,12 @@ class PPOTrainer:
                 old_lp_batch = old_log_probs[idx]
                 adv_batch = advantages[idx]
                 ret_batch = returns[idx]
-                m_batch = masks[idx]
 
-                logits, values = self.agent(s_batch)
-                logits = logits * m_batch + 1e-8
-                probs = logits / logits.sum(dim=-1, keepdim=True)
+                probs, values = self.agent(s_batch)
+                probs = probs / probs.sum(dim=-1, keepdim=True)
                 dist = torch.distributions.Categorical(probs)
                 log_probs = dist.log_prob(a_batch)
                 entropy = dist.entropy()
-                values = values.squeeze(-1)
 
                 ratios = torch.exp(log_probs - old_lp_batch)
                 surr1 = ratios * adv_batch
@@ -259,7 +281,6 @@ class PPOTrainer:
                 entropy_loss = entropy.mean()
 
                 loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy_loss
-                # loss = actor_loss + 0.5 * critic_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
