@@ -10,6 +10,8 @@ import numpy as np
 from typing import List, Tuple
 import random
 import math
+import copy
+
 
 class Env:
     H: int = 4
@@ -25,6 +27,8 @@ class Env:
         self.C = C
         self.state: List[List[int]] = []
         self.max_num = 0
+        self.invalid_step = 0
+        self.invalid_thresold = 16
         self.reset()
 
     @staticmethod
@@ -37,12 +41,14 @@ class Env:
         self.state = [[0 for _ in range(self.W)] for _ in range(self.H)]
         self._add_random_tile()
         self.max_num = max(max(row) for row in self.state)
+        self.invalid_step = 0
         return self._create_onehot()
     
-    def set_state(self, state):
+    def set_state(self, state) -> np.ndarray:
         """设置游戏状态"""
         assert len(state) == self.H and all(len(row) == self.W for row in state)
         self.state = [[state[i][j] for j in range(self.W)] for i in range(self.H)]
+        return self._create_onehot()
 
     def _add_random_tile(self) -> int:
         """在空白位置随机添加一个新数字（2 或 4），返回该数字"""
@@ -56,7 +62,11 @@ class Env:
         return val
 
     def check_game_over(self) -> bool:
-        """检查是否游戏结束（无空格且无法合并）"""
+        """检查是否游戏结束"""
+        # 检查无效步数是否累积超过限制
+        if self.invalid_step > self.invalid_thresold:
+            return True
+
         # 检查是否超出可表示范围
         if self.max_num > 32768:
             return True
@@ -75,6 +85,9 @@ class Env:
                     return False
 
         return True
+
+    def get_actions(self) -> List[int]:
+        return self.actions
 
     def get_valid_actions(self) -> List[int]:
         """
@@ -184,6 +197,7 @@ class Env:
         返回: (state, reward, done)
         """
         total_reward = 0
+        origin_state = copy.deepcopy(self.state)
 
         if action == 0:  # left
             for i in range(self.H):
@@ -218,6 +232,10 @@ class Env:
         # 合并生效，需要随机添加新块（add_random_tile不影响reward）
         self._add_random_tile()
 
+        if origin_state == self.state:
+            self.invalid_step += 1
+            total_reward -= 5
+
         done = 1 if self.check_game_over() else 0
 
         return self._create_onehot(), total_reward, done
@@ -227,6 +245,9 @@ class Env:
 
     def get_max(self) -> int:
         return self.max_num
+    
+    def get_invalid_steps(self) -> int:
+        return self.invalid_step
 
     def get_empty_sum(self):
         return sum(cell == 0 for row in self.state for cell in row)
